@@ -12,7 +12,7 @@
 # 基础配置
 # -------------------------------
 _CMH_NAME="Conda Menu Helper"
-_CMH_VERSION="2026.05.30-menu-fast-activate-v9"
+_CMH_VERSION="2026.09.15-menu-quick-back-v11"
 _CMH_INSTALL_DIR="${HOME}/.local/share/conda-menu"
 _CMH_INSTALL_FILE="${_CMH_INSTALL_DIR}/conda-menu.sh"
 _CMH_STATE_DIR="${HOME}/.local/state/conda-menu"
@@ -65,6 +65,21 @@ _cmh_log() {
 _cmh_pause() {
   printf "\n"
   read -r -p "按 Enter 返回菜单..." _cmh_dummy
+}
+
+_cmh_pause_exit() {
+  # 仅用于“切换环境成功”后：按 Enter 直接退出菜单，回到终端使用新环境。
+  printf "\n"
+  read -r -p "按 Enter 退出菜单..." _cmh_dummy
+}
+
+_cmh_run_submenu() {
+  # 主菜单调用子功能的统一入口。
+  # 约定：子功能 return 2 = 用户主动返回/取消，直接回菜单、不再要求按 Enter；
+  #       其他返回码（0 成功 / 1 出错）仍暂停一次，便于阅读输出。
+  "$@"
+  local rc=$?
+  ((rc == 2)) || _cmh_pause
 }
 
 _cmh_confirm() {
@@ -413,7 +428,7 @@ _cmh_manual_set_conda_root() {
   printf "\n"
   local input root
   read -r -p "请输入路径；直接回车取消：" input
-  [[ -z "$input" ]] && return 1
+  [[ -z "$input" ]] && return 2
   input="${input/#\~/$HOME}"
   input="$(_cmh_realpath "$input" 2>/dev/null || printf '%s' "$input")"
 
@@ -720,7 +735,8 @@ _cmh_choose_env() {
   printf "\n" >&2
 
   read -r -p "输入环境序号 / 最近环境字母 / 环境名；q 返回：" n
-  [[ "$n" == "q" || "$n" == "Q" || -z "$n" ]] && return 1
+  # q / 空回车属于用户主动返回，返回码 2 让主菜单跳过暂停。
+  [[ "$n" == "q" || "$n" == "Q" || -z "$n" ]] && return 2
 
   if [[ "$n" =~ ^[0-9]+$ ]]; then
     if (( n >= 0 && n < ${#_cmh_env_arr[@]} )); then
@@ -760,7 +776,7 @@ _cmh_activate_env() {
 
   local env="${1:-}"
   if [[ -z "$env" ]]; then
-    env="$(_cmh_choose_env "进入 / 切换 Conda 环境")" || return 1
+    env="$(_cmh_choose_env "进入 / 切换 Conda 环境")" || return $?
     printf "\n"
   fi
 
@@ -847,7 +863,7 @@ _cmh_create_env() {
 _cmh_remove_env() {
   _cmh_need_conda || return 1
   local env
-  env="$(_cmh_choose_env "删除 Conda 环境")" || return 1
+  env="$(_cmh_choose_env "删除 Conda 环境")" || return $?
   printf "\n"
   if [[ "$env" == "base" ]]; then
     _cmh_err "拒绝删除 base 环境。"
@@ -857,13 +873,14 @@ _cmh_remove_env() {
     conda env remove -n "$env" -y && _cmh_ok "已删除：$env" && _cmh_log "remove: ${env}"
   else
     _cmh_warn "已取消删除。"
+    return 2
   fi
 }
 
 _cmh_clone_env() {
   _cmh_need_conda || return 1
   local src dst
-  src="$(_cmh_choose_env "选择要克隆的源环境")" || return 1
+  src="$(_cmh_choose_env "选择要克隆的源环境")" || return $?
   printf "\n"
   read -r -p "新环境名称：" dst
   [[ -z "$dst" ]] && { _cmh_err "新环境名不能为空。"; return 1; }
@@ -889,7 +906,7 @@ _cmh_create_clone_menu() {
   case "$c" in
     1) _cmh_create_env ;;
     2) _cmh_clone_env ;;
-    0|"") return 0 ;;
+    0|"") return 2 ;;
     *) _cmh_err "选择无效：$c"; return 1 ;;
   esac
 }
@@ -1170,7 +1187,7 @@ _cmh_conda_onoff_menu() {
     1) _cmh_conda_runtime_on ;;
     2) _cmh_conda_runtime_off ;;
     h|H|\?) _cmh_conda_onoff_help ;;
-    0|"") return 0 ;;
+    0|"") return 2 ;;
     *) _cmh_err "选择无效：$c"; return 1 ;;
   esac
 }
@@ -1371,7 +1388,7 @@ _cmh_mirror_menu() {
   local choice
   read -r -p "请选择 [0-9/h]：" choice
   case "$choice" in
-    0|"") return 0 ;;
+    0|"") return 2 ;;
     8) _cmh_show_condarc; return 0 ;;
     9) _cmh_restore_official; return 0 ;;
     h|H|\?) _cmh_mirror_help; return 0 ;;
@@ -1459,10 +1476,17 @@ _cmh_config_log_menu() {
     4) _cmh_need_conda && { printf "\n--- conda info --envs ---\n"; conda info --envs; printf "\n--- conda env list ---\n"; conda env list; } ;;
     5) _cmh_manual_set_conda_root ;;
     6) _cmh_install ;;
-    0|"") return 0 ;;
+    0|"") return 2 ;;
     *) _cmh_err "选择无效。" ;;
   esac
 }
+
+_cmh_menu_exit_notice() {
+  # 菜单退出时的统一日志与提示；[0] 主动退出与“切换成功后退出”共用。
+  _cmh_log "menu exit current_env=${CONDA_DEFAULT_ENV:-none}"
+  _cmh_ok "已退出菜单。当前环境保持为：${CONDA_DEFAULT_ENV:-未激活}"
+}
+
 _cmh_main_menu() {
   _cmh_mkdirs
   _cmh_self_check_registration
@@ -1476,17 +1500,24 @@ _cmh_main_menu() {
     read -r -p "请选择 [0-7/h]：" choice
     printf "\n"
     case "$choice" in
-      1) _cmh_activate_env; _cmh_pause ;;
-      2) _cmh_create_clone_menu; _cmh_pause ;;
-      3) _cmh_conda_onoff_menu; _cmh_pause ;;
-      4) _cmh_remove_env; _cmh_pause ;;
-      5) _cmh_mirror_menu; _cmh_pause ;;
+      1)
+        # 切换成功：按 Enter 直接退出菜单；用户取消（q / 空回车）：直接回菜单；失败：暂停看报错。
+        _cmh_activate_env
+        case $? in
+          0) _cmh_pause_exit; _cmh_menu_exit_notice; break ;;
+          2) ;;
+          *) _cmh_pause ;;
+        esac
+        ;;
+      2) _cmh_run_submenu _cmh_create_clone_menu ;;
+      3) _cmh_run_submenu _cmh_conda_onoff_menu ;;
+      4) _cmh_run_submenu _cmh_remove_env ;;
+      5) _cmh_run_submenu _cmh_mirror_menu ;;
       6) _cmh_restore_official; _cmh_pause ;;
-      7) _cmh_config_log_menu; _cmh_pause ;;
+      7) _cmh_run_submenu _cmh_config_log_menu ;;
       h|H|\?) _cmh_help; _cmh_pause ;;
       0|q|Q)
-        _cmh_log "menu exit current_env=${CONDA_DEFAULT_ENV:-none}"
-        _cmh_ok "已退出菜单。当前环境保持为：${CONDA_DEFAULT_ENV:-未激活}"
+        _cmh_menu_exit_notice
         break
         ;;
       *)
@@ -1518,6 +1549,7 @@ ${_CMH_NAME} v${_CMH_VERSION}
 
 菜单：
   [1] 切换环境：数字选全部环境，A-F 选最近环境。
+      切换成功后按 Enter 直接退出菜单，回到终端使用新环境；其他操作仍返回菜单。
   [2] 新建 / 克隆：创建环境或从已有环境克隆。
   [3] Conda on/off：当前终端启用 / 停用 conda。
   [5] 换源测速：测速后手动选择镜像源。
