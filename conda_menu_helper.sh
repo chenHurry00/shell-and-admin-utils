@@ -12,7 +12,7 @@
 # 基础配置
 # -------------------------------
 _CMH_NAME="Conda Menu Helper"
-_CMH_VERSION="2026.09.15-miniforge-parity-v12"
+_CMH_VERSION="2026.09.16-review-fixes-v14"
 _CMH_INSTALL_DIR="${HOME}/.local/share/conda-menu"
 _CMH_INSTALL_FILE="${_CMH_INSTALL_DIR}/conda-menu.sh"
 _CMH_STATE_DIR="${HOME}/.local/state/conda-menu"
@@ -119,8 +119,13 @@ _cmh_install() {
     return 1
   fi
 
-  cp -f "$src" "${_CMH_INSTALL_FILE}"
-  chmod +x "${_CMH_INSTALL_FILE}"
+  if [[ "$(_cmh_realpath "$src")" == "$(_cmh_realpath "${_CMH_INSTALL_FILE}")" ]]; then
+    # 从菜单 [7]→[6] 进来时，运行的本来就是已安装副本，cp 同文件会报错且刷不动。
+    _cmh_info "当前运行的就是已安装副本，跳过复制。更新请用：bash <脚本源文件> --install"
+  else
+    cp -f "$src" "${_CMH_INSTALL_FILE}"
+    chmod +x "${_CMH_INSTALL_FILE}"
+  fi
 
   local block
   block="$(_cmh_bashrc_block)"
@@ -499,7 +504,7 @@ _cmh_diagnose_conda_paths() {
   printf "CONDA_PREFIX：%s\n" "${CONDA_PREFIX:-未设置}"
   printf "已保存安装目录："
   if [[ -s "${_CMH_ROOT_FILE}" ]]; then
-    paste -sd ', ' "${_CMH_ROOT_FILE}"
+    paste -sd, "${_CMH_ROOT_FILE}" | sed 's/,/, /g'
   else
     printf "未设置\n"
   fi
@@ -638,7 +643,7 @@ _cmh_record_recent() {
 
 _cmh_print_recent_inline() {
   if [[ -s "${_CMH_RECENT_FILE}" ]]; then
-    head -n 5 "${_CMH_RECENT_FILE}" | paste -sd ', ' -
+    head -n 5 "${_CMH_RECENT_FILE}" | paste -sd, - | sed 's/,/, /g'
   else
     printf "暂无"
   fi
@@ -873,8 +878,34 @@ _cmh_remove_env() {
     _cmh_err "拒绝删除 base 环境。"
     return 1
   fi
+  # 删除前先看有没有 systemd 单元把该环境的路径写死：删掉后它们会启动失败。
+  local refs count
+  refs="$(_cmh_service_env_refs "$env")"
+  if [[ -n "$refs" ]]; then
+    count="$(printf '%s\n' "$refs" | grep -c .)"
+    _cmh_warn "有 ${count} 处 systemd 引用指向该环境："
+    printf '%s\n' "$refs" | awk -F'\t' '{ e=$4; if (length(e) > 88) e = substr(e, 1, 88) "…"; printf "    - %-34s %s\n", $1, e }'
+    if ! _cmh_confirm "仍要删除 ${env}？删除后这些单元会启动失败"; then
+      _cmh_warn "已取消删除。"
+      return 2
+    fi
+  fi
   if _cmh_confirm "确认删除环境 ${env}？该操作不可逆"; then
-    conda env remove -n "$env" -y && _cmh_ok "已删除：$env" && _cmh_log "remove: ${env}"
+    # 路径型环境（conda create -p）必须用 -p：-n 传路径会被 conda 直接拒绝。
+    local -a rmargs=(env remove -y)
+    if [[ "$env" == /* ]]; then
+      rmargs+=(-p "$env")
+    else
+      rmargs+=(-n "$env")
+    fi
+    if conda "${rmargs[@]}"; then
+      _cmh_ok "已删除：$env"
+      _cmh_log "remove: ${env}"
+    else
+      _cmh_err "删除失败：$env"
+      _cmh_log "remove failed: ${env}"
+      return 1
+    fi
   else
     _cmh_warn "已取消删除。"
     return 2
@@ -1260,8 +1291,15 @@ _cmh_conda_channel_family() {
     case "$(basename "$root")" in
       *forge*) printf 'conda-forge'; return 0 ;;
     esac
-    # 兜底：安装目录自带的 .condarc 已经限定 conda-forge。
+    # 兜底 1：安装目录自带的 .condarc 已经限定 conda-forge。
     if [[ -f "$root/.condarc" ]] && grep -q 'conda-forge' "$root/.condarc" 2>/dev/null; then
+      printf 'conda-forge'; return 0
+    fi
+    # 兜底 2：conda 包自己的来源渠道（安装时记录在 conda-meta，零成本读取）。
+    # 目录被改名、根目录 .condarc 被删掉时，前两条都会失效，这条还能判断。
+    local ch=""
+    ch="$(grep -ho '"channel"[[:space:]]*:[[:space:]]*"[^"]*"' "$root"/conda-meta/conda-[0-9]*.json 2>/dev/null | head -1)"
+    if [[ "$ch" == *conda-forge* ]]; then
       printf 'conda-forge'; return 0
     fi
   fi
@@ -1434,9 +1472,12 @@ _cmh_speed_one() {
     rc=$?
     (( rc == 0 )) || t=""
   else
-    local start end
+    local start end opt=()
+    # timeout 兜底：wget 的 --timeout 是分阶段超时，没有总时长上限，
+    # 遇到忽略 Range 的服务器可能整包下载几十 MB 把菜单卡住。
+    command -v timeout >/dev/null 2>&1 && opt=(timeout 15)
     start="$(date +%s%3N 2>/dev/null || date +%s)"
-    wget -q --timeout=12 --tries=1 --header='Range: bytes=0-262143' -O /dev/null "$test_url" >/dev/null 2>&1
+    "${opt[@]}" wget -q --timeout=12 --tries=1 --header='Range: bytes=0-262143' -O /dev/null "$test_url" >/dev/null 2>&1
     rc=$?
     end="$(date +%s%3N 2>/dev/null || date +%s)"
     if (( rc == 0 )); then
@@ -1576,6 +1617,317 @@ _cmh_show_logs() {
 }
 
 # -------------------------------
+# 服务引用（只读）：systemd 单元里写死的 conda 环境路径
+# -------------------------------
+_cmh_systemd_dirs() {
+  # 扫描范围：系统单元目录 + 当前用户的用户单元目录。
+  local d
+  for d in "/etc/systemd/system" "/lib/systemd/system" "/usr/lib/systemd/system" "${HOME}/.config/systemd/user"; do
+    [[ -d "$d" ]] && printf '%s\n' "$d"
+  done
+}
+
+_cmh_service_candidates() {
+  # 输出“可能引用 conda 环境”的单元名（去重；drop-in 归属到所属单元）。只读。
+  local dirs=() f unit
+  mapfile -t dirs < <(_cmh_systemd_dirs)
+  (( ${#dirs[@]} == 0 )) && return 0
+  grep -rlE '/(miniforge3|mambaforge|miniconda3|anaconda3|conda)(/|$)|/etc/profile\.d/conda\.sh|conda[[:space:]]+activate|/envs/[^/[:space:]]+/bin/' \
+    "${dirs[@]}" 2>/dev/null | while IFS= read -r f; do
+      case "$f" in
+        *.d/*.conf) unit="$(basename "${f%%.d/*}")" ;;
+        *) unit="$(basename "$f")" ;;
+      esac
+      printf '%s\n' "$unit"
+    done | _cmh_unique_lines
+}
+
+_cmh_unit_content() {
+  # 优先 systemctl cat / systemctl --user cat（拿到含 drop-in 的生效内容）；
+  # 两者都拿不到（单元未加载、容器/WSL、单元不存在）时，退回直接读单元文件 + drop-in 目录。
+  local unit="$1" dir content
+  if command -v systemctl >/dev/null 2>&1; then
+    content="$(systemctl cat "$unit" 2>/dev/null || true)"
+    if [[ -z "$content" ]]; then
+      content="$(systemctl --user cat "$unit" 2>/dev/null || true)"
+    fi
+    if [[ -n "$content" ]]; then
+      printf '%s\n' "$content"
+      return 0
+    fi
+  fi
+  while IFS= read -r dir; do
+    if [[ -f "$dir/$unit" || -d "$dir/$unit.d" ]]; then
+      [[ -f "$dir/$unit" ]] && cat "$dir/$unit"
+      # drop-in 是被漏检的高发点（片段②推荐的写法就是 drop-in），必须一起读。
+      cat "$dir/$unit".d/*.conf 2>/dev/null || true
+      return 0
+    fi
+  done < <(_cmh_systemd_dirs)
+  return 1
+}
+
+_cmh_parse_unit_refs() {
+  # $1 = 单元名；stdin = 单元内容。输出 TSV：单元<TAB>环境<TAB>形态<TAB>证据行
+  # 解析规则（与 systemd 的实际行为对齐，来源见各分支注释）：
+  #   - 路径形态（/…/envs/<名字>/…、<root>/bin/…、<root>/etc/profile.d/conda.sh）
+  #     对所有“非纯文本指令”解析：ConditionPathExists=、ReadWritePaths=、
+  #     StandardOutput=append:… 同样是对环境路径的真实依赖，漏检会让删除告警失效；
+  #   - 命令形态（conda activate <名字>）只在可能真正执行命令的指令上解析
+  #     （Exec*= / Environment= / EnvironmentFile=），Description 之类自由文本里的
+  #     “conda activate xxx” 不会变成幻影引用；
+  #   - 续行与 systemd 一致：只有空行打断续行，注释行不打断；
+  #   - 跳过 Description / Documentation / Alias / Comment 等纯文本指令（含其续行）。
+  awk -v unit="$1" '
+    function trim(s) { gsub(/^[[:space:]]+/, "", s); gsub(/[[:space:]]+$/, "", s); return s }
+    BEGIN { key = ""; cont = 0 }
+    {
+      line = trim($0)
+      if (line == "") { key = ""; cont = 0; next }
+      if (line ~ /^#/) { next }                    # 注释不打断续行（systemd 行为）
+      if (line ~ /^[A-Za-z][A-Za-z0-9-]*[[:space:]]*=/) {
+        key = line
+        sub(/[[:space:]]*=.*/, "", key)
+        cont = (line ~ /\\$/)
+      } else if (cont) {
+        cont = (line ~ /\\$/)                      # 续行继承所属指令，可继续再续
+      } else {
+        key = ""
+        next
+      }
+      if (key ~ /^(Description|Documentation|Alias|SyslogIdentifier|Comment)$/) next
+      clean = line
+      gsub(/["\047]/, "", clean)
+      if (match(clean, /\/envs\/[^\/[:space:]]+(\/|[[:space:]]|$)/)) {
+        seg = substr(clean, RSTART, RLENGTH)
+        sub(/^\/envs\//, "", seg)
+        sub(/[\/[:space:]]+$/, "", seg)
+        printf "%s\t%s\t%s\t%s\n", unit, seg, "路径直写", line
+        next
+      }
+      if (key ~ /^(Exec[A-Za-z]*|Environment|EnvironmentFile)$/ && match(clean, /conda[[:space:]]+activate[[:space:]]+[^[:space:];]+/)) {
+        seg = substr(clean, RSTART, RLENGTH)
+        sub(/.*activate[[:space:]]+/, "", seg)
+        printf "%s\t%s\t%s\t%s\n", unit, seg, "conda activate", line
+        next
+      }
+      if (clean ~ /\/etc\/profile\.d\/conda\.sh/) {
+        # 只 source conda.sh 不 activate → 依赖的是该安装的 base 环境
+        printf "%s\t%s\t%s\t%s\n", unit, "base", "conda.sh", line
+        next
+      }
+      if (clean ~ /(miniforge3|mambaforge|miniconda3|anaconda3|conda)\/(bin|condabin)\//) {
+        printf "%s\t%s\t%s\t%s\n", unit, "base", "路径直写", line
+      }
+    }
+  '
+}
+
+_cmh_service_refs() {
+  # 输出所有候选单元的引用关系（TSV）。只读。
+  local unit
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    _cmh_unit_content "$unit" | _cmh_parse_unit_refs "$unit"
+  done < <(_cmh_service_candidates)
+}
+
+_cmh_service_env_refs() {
+  # $1 = 环境名或环境路径；输出引用了该环境的 TSV 行（只读）。
+  # 路径型环境（/data/envs/x）在单元里通常写成 envs/x/…，所以再按 basename 比一次。
+  local env="$1" base="$1"
+  [[ "$env" == /* ]] && base="$(basename "$env")"
+  _cmh_service_refs | awk -F'\t' -v e="$env" -v b="$base" '$2 == e || $2 == b'
+}
+
+_cmh_service_scan_show() {
+  local refs dirs
+  _cmh_hr
+  printf "%b引用 conda 环境的 systemd 单元%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
+  dirs="$(_cmh_systemd_dirs | paste -sd, - | sed 's/,/, /g')"
+  _cmh_info "扫描范围：${dirs:-未找到 systemd 目录}"
+  refs="$(_cmh_service_refs)"
+  if [[ -z "$refs" ]]; then
+    _cmh_info "未发现引用 conda 环境的单元（只查了单元文件里的路径/activate 写法）。"
+    return 0
+  fi
+
+  printf '\n'
+  printf '%s\n' "$refs" | sort -t$'\t' -k2,2 -k1,1 | awk -F'\t' '
+    { if ($2 != last_env) { printf "环境 %s：\n", $2; last_env = $2 }
+      printf "  - %-38s %-15s %s\n", $1, $3, $4 }
+  '
+  printf "\n共 %s 条引用，涉及 %s 个环境。\n" \
+    "$(printf '%s\n' "$refs" | grep -c .)" \
+    "$(printf '%s\n' "$refs" | cut -f2 | sort -u | wc -l | tr -d ' ')"
+
+  # 标注“被引用但当前 conda 里没有”的环境。只有引用确实落在当前 conda 根目录下时，
+  # 才能断定“删了/改了会让单元启动失败”；否则可能属于另一个 conda 安装（或模板变量）。
+  if _cmh_load_env_arrays >/dev/null 2>&1 && (( ${#_cmh_env_arr[@]} > 0 )); then
+    local cur_root ref_roots
+    cur_root="$(_cmh_guess_conda_root_quiet 2>/dev/null || true)"
+    while IFS= read -r e; do
+      [[ "$e" == *'%'* || "$e" == *'$'* ]] && continue
+      _cmh_env_in_loaded_array "$e" && continue
+      # 判断这个引用属于哪个 conda 安装：
+      #   ① 证据行里有 /<根>/envs/<名字>/…        → 取该根的路径
+      #   ② 证据行里有 /<根>/etc/profile.d/conda.sh → 取该根的路径（conda activate 形态的常见写法）
+      #   ③ 都没有但用了 conda activate            → 视为当前安装（activate 靠当前 shell 的 conda 解析）
+      # 路径字符里排除 ':'，否则一行里多个 PATH 条目会被“左最长匹配”吞成一整段。
+      ref_roots="$(printf '%s\n' "$refs" | awk -F'\t' -v e="$e" -v cur="$cur_root" '
+        $2 != e { next }
+        {
+          line = $4
+          if (match(line, /\/[^ \t:]*\/envs\//)) { print substr(line, RSTART, RLENGTH - 6); next }
+          if (match(line, /\/[^ \t:]*\/etc\/profile\.d\/conda\.sh/)) { print substr(line, RSTART, RLENGTH - 23); next }
+          if (line ~ /conda[[:space:]]+activate/ && cur != "") print cur
+        }' | sort -u | paste -sd, - | sed 's/,/, /g')"
+      # 根目录逐个精确比较（用逗号定界，避免 /opt/base 命中 /opt/base2）。
+      if [[ -n "$cur_root" && ",$ref_roots," == *",$cur_root,"* ]]; then
+        _cmh_warn "环境 ${e} 在当前 conda 中不存在（引用它的单元会启动失败）"
+      else
+        _cmh_info "环境 ${e} 未被当前 conda 发现（引用来自其它安装：${ref_roots:-无法判断}）"
+      fi
+    done < <(printf '%s\n' "$refs" | cut -f2 | sort -u)
+  fi
+  _cmh_info "改动单元后需要：sudo systemctl daemon-reload"
+  _cmh_log "service scan refs=$(printf '%s\n' "$refs" | grep -c .)"
+}
+
+_cmh_service_snippet() {
+  local env root interp bindir refs
+  env="$(_cmh_choose_env "为哪个环境生成 ExecStart 片段")" || return $?
+  printf "\n"
+
+  root="$(_cmh_guess_conda_root_quiet 2>/dev/null || true)"
+  if [[ -z "$root" ]]; then
+    _cmh_err "未找到 conda 安装目录。可先在 [7]→[5] 手动指定。"
+    return 1
+  fi
+
+  if [[ "$env" == /* ]]; then
+    interp="$env/bin/python"
+  elif [[ "$env" == "base" ]]; then
+    interp="$root/bin/python"
+  else
+    interp="$root/envs/$env/bin/python"
+  fi
+  bindir="$(dirname "$interp")"
+
+  _cmh_hr
+  printf "%b为环境 %s 生成的服务片段%b\n" "${_CMH_BOLD}" "$env" "${_CMH_RESET}"
+  if [[ -x "$interp" ]]; then
+    _cmh_info "解释器：${interp}"
+  else
+    _cmh_warn "解释器不存在或不可执行：${interp}"
+  fi
+  printf "\n① 直接指定解释器（推荐，不依赖 PATH/conda）：\n"
+  printf "     ExecStart=%s /path/to/your_script.py\n" "$interp"
+  printf "\n② 需要 PATH 里有该环境（pip 安装的命令行工具等）：\n"
+  printf "     Environment=PATH=%s:/usr/local/bin:/usr/bin:/bin\n" "$bindir"
+  printf "\n③ 脚本内部还要用 conda（激活别的环境、conda install 等）：\n"
+  printf "     ExecStart=/bin/bash -lc 'source %s/etc/profile.d/conda.sh && conda activate %s && exec python /path/to/your_script.py'\n" "$root" "$env"
+  printf "\n改完单元文件或 drop-in 之后：\n"
+  printf "     sudo systemctl daemon-reload && sudo systemctl try-restart <unit>\n"
+  printf "\n先确认该环境自身可用（Jetson 上尤其要验证 torch/CUDA）：\n"
+  printf "     %s -c 'import sys; print(sys.version)'\n" "$interp"
+
+  printf "\n当前引用该环境的单元：\n"
+  refs="$(_cmh_service_env_refs "$env")"
+  if [[ -n "$refs" ]]; then
+    printf '%s\n' "$refs" | awk -F'\t' '{ printf "  - %-38s %s\n", $1, $3 }'
+  else
+    printf "  （暂无）\n"
+  fi
+  _cmh_log "service snippet env=${env} root=${root}"
+}
+
+_cmh_service_debug() {
+  local units=() choice unit i logs
+  mapfile -t units < <(_cmh_service_candidates)
+  if (( ${#units[@]} > 0 )); then
+    printf "已扫描到的候选单元：\n"
+    for i in "${!units[@]}"; do printf "  [%d] %s\n" "$i" "${units[$i]}"; done
+    printf "\n"
+  fi
+  read -r -p "输入序号或单元名（如 rl.service）；q 返回：" choice
+  case "$choice" in q|Q|"") return 2 ;; esac
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < ${#units[@]} )); then
+    unit="${units[$choice]}"
+  else
+    unit="$choice"
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    _cmh_err "本机没有 systemctl，无法查看单元状态。"
+    return 1
+  fi
+
+  # 判断这个单元属于 system 域还是 --user 域（LoadState=not-found 说明不在该域）。
+  local scope="system" loadstate
+  loadstate="$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)"
+  if [[ -z "$loadstate" || "$loadstate" == "not-found" ]]; then
+    loadstate="$(systemctl --user show -p LoadState --value "$unit" 2>/dev/null || true)"
+    [[ -n "$loadstate" && "$loadstate" != "not-found" ]] && scope="user"
+  fi
+
+  _cmh_hr
+  printf "%b%s%b（%s 单元）\n" "${_CMH_BOLD}" "$unit" "${_CMH_RESET}" "$scope"
+  if [[ "$scope" == "user" ]]; then
+    systemctl --user status --no-pager -n 10 "$unit" 2>&1 | head -25 || true
+    printf "\n最近 30 条日志：\n"
+    logs="$(journalctl --user -u "$unit" -n 30 --no-pager 2>&1)" || true
+  else
+    systemctl status --no-pager -n 10 "$unit" 2>&1 | head -25 || true
+    printf "\n最近 30 条日志：\n"
+    logs="$(journalctl -u "$unit" -n 30 --no-pager 2>&1)" || true
+  fi
+  if [[ -n "$logs" ]]; then
+    printf '%s\n' "$logs" | head -40
+  else
+    _cmh_warn "读不到日志；系统单元可能需要：sudo journalctl -u ${unit} -n 50"
+  fi
+  _cmh_log "service debug unit=${unit} scope=${scope}"
+}
+
+_cmh_service_help() {
+  _cmh_hr
+  printf "%b服务引用帮助（只读）%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
+  cat <<EOF
+做什么：
+  - 扫描 ${HOME}/.config/systemd/user、/etc/systemd/system、/lib/systemd/system 等目录里的单元，
+    找出把 conda 环境路径写死的地方（含 drop-in）。
+  - 识别三种写法：① .../envs/<名字>/... ② conda activate <名字> ③ <root>/bin/python（base）。
+  - 为指定环境生成可粘贴的 ExecStart / Environment=PATH / bash -lc 片段。
+  - 查看单元状态与最近日志（systemctl status、journalctl -u）。
+
+不做的事：不写单元文件、不执行 daemon-reload、不重启服务、不调用 sudo。
+[4] 删除环境前会用同一套扫描做引用告警。
+EOF
+}
+
+_cmh_service_menu() {
+  _cmh_hr
+  printf "%b服务引用（只读）%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
+  printf "  [1] 扫描引用 conda 环境的服务\n"
+  printf "  [2] 为环境生成 ExecStart / PATH 片段\n"
+  printf "  [3] 查看服务状态与日志\n"
+  printf "  [h] 帮助\n"
+  printf "  [0] 返回\n"
+  printf "\n"
+  local c
+  read -r -p "请选择 [0-3/h]：" c
+  case "$c" in
+    1) _cmh_service_scan_show ;;
+    2) _cmh_service_snippet ;;
+    3) _cmh_service_debug ;;
+    h|H|\?) _cmh_service_help ;;
+    0|"") return 2 ;;
+    *) _cmh_err "选择无效：$c"; return 1 ;;
+  esac
+}
+
+# -------------------------------
 # 主菜单
 # -------------------------------
 _cmh_header() {
@@ -1597,6 +1949,7 @@ _cmh_menu_once() {
   printf "  [5] 换源测速\n"
   printf "  [6] 恢复官方源\n"
   printf "  [7] 配置 / 日志\n"
+  printf "  [8] 服务引用\n"
   printf "  [h] 帮助\n"
   printf "  [0] 退出\n"
   printf "\n"
@@ -1642,7 +1995,16 @@ _cmh_main_menu() {
   while true; do
     printf "\n"
     _cmh_menu_once
-    read -r -p "请选择 [0-7/h]：" choice
+    # stdin 到 EOF（Ctrl-D、cx < /dev/null、管道/CI 调用）时 read 返回非 0：
+    #   - 完全没读到内容 → 直接退出菜单，否则会在 EOF 下无限刷“无效选择”；
+    #   - 读到了内容但缺结尾换行（如 printf '0'）→ 照常处理这一行。
+    if ! read -r -p "请选择 [0-8/h]：" choice; then
+      if [[ -z "$choice" ]]; then
+        printf "\n"
+        _cmh_info "输入结束，退出菜单。"
+        break
+      fi
+    fi
     printf "\n"
     case "$choice" in
       1)
@@ -1660,6 +2022,7 @@ _cmh_main_menu() {
       5) _cmh_run_submenu _cmh_mirror_menu ;;
       6) _cmh_restore_official; _cmh_pause ;;
       7) _cmh_run_submenu _cmh_config_log_menu ;;
+      8) _cmh_run_submenu _cmh_service_menu ;;
       h|H|\?) _cmh_help; _cmh_pause ;;
       0|q|Q)
         _cmh_menu_exit_notice
@@ -1699,6 +2062,8 @@ ${_CMH_NAME} v${_CMH_VERSION}
   [3] Conda on/off：当前终端启用 / 停用 conda。
   [5] 换源测速：测速后手动选择镜像源。
   [7] 配置 / 日志：查看 condarc、日志、诊断信息、指定 Conda 目录。
+  [8] 服务引用：扫描引用 conda 环境的 systemd 单元（只读），生成 ExecStart 片段，
+      查看服务状态与日志；删除环境前会自动做引用告警。全程不调用 sudo。
 HELP
 }
 _cmh_dispatch() {
