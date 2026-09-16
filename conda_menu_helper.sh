@@ -12,7 +12,7 @@
 # 基础配置
 # -------------------------------
 _CMH_NAME="Conda Menu Helper"
-_CMH_VERSION="2026.09.15-menu-quick-back-v11"
+_CMH_VERSION="2026.09.15-miniforge-parity-v12"
 _CMH_INSTALL_DIR="${HOME}/.local/share/conda-menu"
 _CMH_INSTALL_FILE="${_CMH_INSTALL_DIR}/conda-menu.sh"
 _CMH_STATE_DIR="${HOME}/.local/state/conda-menu"
@@ -25,6 +25,17 @@ _CMH_MARK_BEGIN="# >>> conda-menu-helper >>>"
 _CMH_MARK_END="# <<< conda-menu-helper <<<"
 _CMH_CONDA_INIT_BEGIN="# >>> conda initialize >>>"
 _CMH_CONDA_INIT_END="# <<< conda initialize <<<"
+
+# 常见 conda 安装目录候选。与发行版无关：miniconda / anaconda / miniforge / mambaforge
+# 都使用同一套 bin|condabin|etc/profile.d 布局，这里统一列出，避免某个发行版漏检。
+_CMH_COMMON_ROOTS=(
+  "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "$HOME/mambaforge"
+  "$HOME/.conda" "$HOME/.miniconda3"
+  "/opt/conda" "/opt/miniconda3" "/opt/anaconda3" "/opt/miniforge3" "/opt/mambaforge"
+  "/usr/local/conda" "/usr/local/miniconda3" "/usr/local/anaconda3" "/usr/local/miniforge3" "/usr/local/mambaforge"
+  "/data/conda" "/data/miniconda3" "/data/anaconda3" "/data/miniforge3" "/data/mambaforge"
+  "/mnt/conda" "/mnt/miniconda3" "/mnt/anaconda3" "/mnt/miniforge3" "/mnt/mambaforge"
+)
 
 # 不要 clear：用户明确要求保留上方执行信息。
 # 本脚本全程不调用 clear / reset。
@@ -367,14 +378,7 @@ _cmh_load_conda() {
   fi
 
   # 3) 常见目录。这里会解析软链接，例如 ~/miniconda3 -> /data/app/miniconda3。
-  for root in \
-    "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "$HOME/mambaforge" \
-    "$HOME/.conda" "$HOME/.miniconda3" \
-    "/opt/conda" "/opt/miniconda3" "/opt/anaconda3" "/opt/miniforge3" "/opt/mambaforge" \
-    "/usr/local/conda" "/usr/local/miniconda3" "/usr/local/anaconda3" \
-    "/data/conda" "/data/miniconda3" "/data/anaconda3" \
-    "/mnt/conda" "/mnt/miniconda3" "/mnt/anaconda3"
-  do
+  for root in "${_CMH_COMMON_ROOTS[@]}"; do
     _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
   done
 
@@ -477,7 +481,7 @@ _cmh_guess_conda_root_quiet() {
     [[ -n "$root" && -d "$root" ]] && { printf '%s\n' "$root"; return 0; }
   fi
 
-  for root in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3"               "/opt/conda" "/opt/miniconda3" "/usr/local/miniconda3"               "/data/miniconda3" "/mnt/miniconda3"; do
+  for root in "${_CMH_COMMON_ROOTS[@]}"; do
     rr="$(_cmh_realpath "$root" 2>/dev/null || printf '%s' "$root")"
     if [[ -d "$rr" && ( -f "$rr/etc/profile.d/conda.sh" || -f "$rr/bin/conda" || -f "$rr/condabin/conda" ) ]]; then
       printf '%s\n' "$rr"
@@ -512,7 +516,7 @@ _cmh_diagnose_conda_paths() {
 
   printf "\n常见路径检查：\n"
   local root rr
-  for root in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "/opt/conda" "/opt/miniconda3" "/usr/local/miniconda3" "/data/miniconda3" "/mnt/miniconda3"; do
+  for root in "${_CMH_COMMON_ROOTS[@]}"; do
     rr="$(_cmh_realpath "$root" 2>/dev/null || printf '%s' "$root")"
     if [[ -e "$root" || -e "$rr" ]]; then
       printf "  %-32s -> %s\n" "$root" "$rr"
@@ -1247,6 +1251,23 @@ _cmh_recent_menu() {
 # -------------------------------
 # 镜像源管理
 # -------------------------------
+_cmh_conda_channel_family() {
+  # 发行版的默认渠道：miniforge/mambaforge 出厂只配 conda-forge，
+  # miniconda/anaconda 默认 defaults。换源、恢复官方源、测速都按它选择语义。
+  local root=""
+  root="$(_cmh_guess_conda_root_quiet 2>/dev/null || true)"
+  if [[ -n "$root" ]]; then
+    case "$(basename "$root")" in
+      *forge*) printf 'conda-forge'; return 0 ;;
+    esac
+    # 兜底：安装目录自带的 .condarc 已经限定 conda-forge。
+    if [[ -f "$root/.condarc" ]] && grep -q 'conda-forge' "$root/.condarc" 2>/dev/null; then
+      printf 'conda-forge'; return 0
+    fi
+  fi
+  printf 'defaults'
+}
+
 _cmh_backup_condarc() {
   _cmh_mkdirs
   if [[ -f "${HOME}/.condarc" ]]; then
@@ -1256,11 +1277,75 @@ _cmh_backup_condarc() {
   fi
 }
 
+_cmh_condarc_preserved_part() {
+  # 输出 ~/.condarc 中“非渠道键”的原文。本脚本管理下面这些键（写入时由本脚本决定）：
+  #   channels / default_channels / custom_channels / mirrored_channels / show_channel_urls
+  # 其余（auto_activate、channel_priority、pkgs_dirs、envs_dirs…）原样保留，
+  # 避免换源时被静默丢掉；漏掉受管键会导致重复键，conda 的 YAML 解析会直接报错。
+  local file="${1:-${HOME}/.condarc}"
+  [[ -f "$file" ]] || return 0
+  awk -v drop='^(channels|default_channels|custom_channels|mirrored_channels|show_channel_urls)[[:space:]]*:' '
+    {
+      # 空行与注释：不在被删除的块里就保留
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) { if (!skip) print; next }
+      # 顶层键（行首既不是空白也不是 -）：判断是否属于本脚本管理的键
+      if ($0 ~ /^[^[:space:]-]/) { skip = ($0 ~ drop) ? 1 : 0; if (!skip) print; next }
+      # 顶层列表项（紧跟在某个键之后，可能是列在行首的 - 项）
+      if ($0 ~ /^-([[:space:]]|$)/) { if (!skip) print; next }
+      # 其余为缩进内容
+      if (!skip) print
+    }' "$file"
+}
+
+_cmh_condarc_apply() {
+  # 用 stdin 传入受管的渠道配置，与原有非渠道键合并后写回 ~/.condarc。
+  # 调用方需先执行 _cmh_backup_condarc。
+  local managed kept keys
+  managed="$(cat)"
+  kept="$(_cmh_condarc_preserved_part)"
+  {
+    printf '%s\n' "$managed"
+    if [[ -n "${kept//[[:space:]]/}" ]]; then
+      printf '\n# 以下为换源前已有的非渠道配置，由 conda-menu-helper 原样保留：\n'
+      printf '%s\n' "$kept"
+    fi
+  } > "${HOME}/.condarc"
+
+  keys="$(printf '%s\n' "$kept" | grep -E '^[^[:space:]-]' | grep -v '^#' | sed 's/[[:space:]]*:.*//' | paste -sd, - | sed 's/,/, /g')"
+  if [[ -n "$keys" ]]; then
+    _cmh_info "已保留原有配置项：${keys}"
+  fi
+  _cmh_log "condarc rewrite keep=${keys:-none}"
+}
+
+_cmh_condarc_check() {
+  # 写回后用 conda 自己校验一遍语法；失败只告警，可从未改动前的备份恢复。
+  if _cmh_need_conda >/dev/null 2>&1; then
+    if ! conda config --show channels >/dev/null 2>&1; then
+      _cmh_warn "写回的 ~/.condarc 可能无法被 conda 解析，可从备份恢复：${_CMH_BACKUP_DIR}"
+    fi
+  fi
+}
+
 _cmh_write_condarc_for_base() {
   local base_url="$1"
   local name="$2"
+  local family
+  family="$(_cmh_conda_channel_family)"
   _cmh_backup_condarc
-  cat > "${HOME}/.condarc" <<YAML
+  if [[ "$family" == "conda-forge" ]]; then
+    # miniforge/mambaforge：默认只走 conda-forge，镜像路径为 <base>/cloud/conda-forge。
+    _cmh_condarc_apply <<YAML
+channels:
+  - conda-forge
+show_channel_urls: true
+custom_channels:
+  conda-forge: ${base_url}/cloud
+  pytorch: ${base_url}/cloud
+  nvidia: ${base_url}/cloud
+YAML
+  else
+    _cmh_condarc_apply <<YAML
 channels:
   - defaults
 show_channel_urls: true
@@ -1273,9 +1358,11 @@ custom_channels:
   pytorch: ${base_url}/cloud
   nvidia: ${base_url}/cloud
 YAML
-  _cmh_ok "已切换 Conda 镜像源：${name}"
+  fi
+  _cmh_ok "已切换 Conda 镜像源：${name}（${family} 渠道）"
   _cmh_info "配置文件：${HOME}/.condarc"
-  _cmh_log "mirror set: ${name} ${base_url}"
+  _cmh_log "mirror set: ${name} ${base_url} family=${family}"
+  _cmh_condarc_check
   if _cmh_need_conda >/dev/null 2>&1; then
     _cmh_info "清理索引缓存：conda clean -i -y"
     conda clean -i -y >/dev/null 2>&1 || true
@@ -1283,21 +1370,53 @@ YAML
 }
 
 _cmh_restore_official() {
+  local family
+  family="$(_cmh_conda_channel_family)"
   _cmh_backup_condarc
-  cat > "${HOME}/.condarc" <<'YAML'
+  if [[ "$family" == "conda-forge" ]]; then
+    _cmh_condarc_apply <<'YAML'
+channels:
+  - conda-forge
+show_channel_urls: true
+YAML
+    _cmh_ok "已恢复为官方 conda-forge 源（miniforge/mambaforge 默认渠道）。"
+  else
+    _cmh_condarc_apply <<'YAML'
 channels:
   - defaults
 show_channel_urls: true
 YAML
-  _cmh_ok "已恢复为官方 defaults 源。"
-  _cmh_log "mirror restore official"
+    _cmh_ok "已恢复为官方 defaults 源。"
+  fi
+  _cmh_log "mirror restore official family=${family}"
+  _cmh_condarc_check
   if _cmh_need_conda >/dev/null 2>&1; then
     conda clean -i -y >/dev/null 2>&1 || true
   fi
 }
 
+_cmh_conda_subdir() {
+  # conda 的平台子目录名，按本机架构输出，供镜像测速等拼接路径使用。
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'linux-64' ;;
+    aarch64|arm64) printf 'linux-aarch64' ;;
+    ppc64le) printf 'linux-ppc64le' ;;
+    s390x) printf 'linux-s390x' ;;
+    *) printf 'linux-%s' "$(uname -m)" ;;
+  esac
+}
+
+_cmh_probe_url() {
+  # $1 = 已经指到“渠道层级”的根目录（如 <镜像>/anaconda/cloud/conda-forge 或 <镜像>/anaconda/pkgs/main），
+  # 拼出本机架构的 repodata 探测地址。
+  printf '%s/%s/repodata.json' "${1%/}" "$(_cmh_conda_subdir)"
+}
+
 _cmh_speed_one() {
-  local url="$1"
+  # 用范围请求只取 repodata 的前 256KB：
+  #   - 走真实 GET，所以被镜像拦截（403）或路径失效（404）会如实判为 FAIL；
+  #   - 不会像整文件下载那样，因为 conda-forge 的 repodata 有几十 MB 而在超时前下不完。
+  local test_url="$1"
   local tool=""
   if command -v curl >/dev/null 2>&1; then
     tool="curl"
@@ -1308,17 +1427,23 @@ _cmh_speed_one() {
     return 1
   fi
 
-  # 测试 linux-64 repodata，能更接近 conda 实际访问。
-  local test_url="${url}/pkgs/main/linux-64/repodata.json"
-  local t
+  local t rc
   if [[ "$tool" == "curl" ]]; then
-    t="$(curl -L -o /dev/null -s -w '%{time_total}' --connect-timeout 4 --max-time 10 "$test_url" 2>/dev/null || true)"
+    # -f：HTTP 错误直接判失败，不要当成“很快”。
+    t="$(curl -fL -o /dev/null -s -w '%{time_total}' -r 0-262143 --connect-timeout 4 --max-time 12 "$test_url" 2>/dev/null)"
+    rc=$?
+    (( rc == 0 )) || t=""
   else
     local start end
     start="$(date +%s%3N 2>/dev/null || date +%s)"
-    wget -q --timeout=10 --tries=1 -O /dev/null "$test_url" >/dev/null 2>&1 || true
+    wget -q --timeout=12 --tries=1 --header='Range: bytes=0-262143' -O /dev/null "$test_url" >/dev/null 2>&1
+    rc=$?
     end="$(date +%s%3N 2>/dev/null || date +%s)"
-    t="$((end-start))ms"
+    if (( rc == 0 )); then
+      t="$((end-start))ms"
+    else
+      t=""
+    fi
   fi
 
   if [[ -z "$t" || "$t" == "0.000000" ]]; then
@@ -1336,42 +1461,62 @@ _cmh_speed_one() {
 _cmh_mirror_help() {
   _cmh_hr
   printf "%b镜像源帮助%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
-  cat <<'EOF'
-测速对象：各源的 pkgs/main/linux-64/repodata.json。
-用途：只判断当前网络下的可访问性和大致响应时间。
+  cat <<EOF
+测速对象：各源在当前渠道下的 repodata.json 前 256KB（本机归档目录：$(_cmh_conda_subdir)）。
+用途：判断可访问性与大致响应速度；403（被拦截）、404（路径失效）、超时都会显示 FAIL。
 选择：测速完成后仍由你手动选择，不自动切换最快源。
-恢复：选择 [9] 可写回官方 defaults 配置。
+恢复：选择 [9] 按当前发行版恢复官方渠道（miniforge/mambaforge → conda-forge，miniconda/anaconda → defaults）。
 EOF
 }
 
 _cmh_mirror_menu() {
   _cmh_hr
   printf "%b镜像源测速与切换%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
+  local family
+  family="$(_cmh_conda_channel_family)"
+  printf "当前渠道：%s\n" "$family"
   printf "\n"
 
   local names=(
     "清华 TUNA"
     "上海交大 SJTUG"
     "北外 BFSU"
-    "阿里云 Aliyun"
+    "南科大 SUSTech"
     "中科大 USTC"
     "南京大学 NJU"
-    "官方 repo.anaconda.com"
+    "官方源"
   )
   local urls=(
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda"
     "https://mirror.sjtu.edu.cn/anaconda"
     "https://mirrors.bfsu.edu.cn/anaconda"
-    "https://mirrors.aliyun.com/anaconda"
+    "https://mirrors.sustech.edu.cn/anaconda"
     "https://mirrors.ustc.edu.cn/anaconda"
     "https://mirrors.nju.edu.cn/anaconda"
     "https://repo.anaconda.com"
   )
 
-  local i result
+  # 每个源在当前渠道下的“渠道根目录”。镜像的 conda-forge 在 <root>/cloud/conda-forge；
+  # 官方 conda-forge 只在 conda.anaconda.org（repo.anaconda.com 不提供 conda-forge）。
+  local last=$(( ${#names[@]} - 1 ))
+  local probes=() i probe result
   for i in "${!names[@]}"; do
-    printf "  [%d] %-22s %s ... " "$((i+1))" "${names[$i]}" "${urls[$i]}"
-    result="$(_cmh_speed_one "${urls[$i]}")"
+    if (( i == last )); then
+      if [[ "$family" == "conda-forge" ]]; then
+        probes+=("https://conda.anaconda.org/conda-forge")
+      else
+        probes+=("https://repo.anaconda.com/pkgs/main")
+      fi
+    elif [[ "$family" == "conda-forge" ]]; then
+      probes+=("${urls[$i]}/cloud/conda-forge")
+    else
+      probes+=("${urls[$i]}/pkgs/main")
+    fi
+  done
+
+  for i in "${!names[@]}"; do
+    printf "  [%d] %-12s %s ... " "$((i+1))" "${names[$i]}" "${probes[$i]}"
+    result="$(_cmh_speed_one "$(_cmh_probe_url "${probes[$i]}")")"
     if [[ "$result" == "FAIL" || "$result" == "NO_TOOL" ]]; then
       printf "%b%s%b\n" "${_CMH_RED}" "$result" "${_CMH_RESET}"
     else
@@ -1396,7 +1541,7 @@ _cmh_mirror_menu() {
 
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
     local idx=$((choice-1))
-    if [[ "${names[$idx]}" == "官方 repo.anaconda.com" ]]; then
+    if (( idx == last )); then
       _cmh_restore_official
     else
       _cmh_write_condarc_for_base "${urls[$idx]}" "${names[$idx]}"
