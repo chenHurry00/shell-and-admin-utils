@@ -12,7 +12,7 @@
 # 基础配置
 # -------------------------------
 _CMH_NAME="Conda Menu Helper"
-_CMH_VERSION="2026.09.16-review-fixes-v14"
+_CMH_VERSION="2026.09.16-mirror-menu-v15"
 _CMH_INSTALL_DIR="${HOME}/.local/share/conda-menu"
 _CMH_INSTALL_FILE="${_CMH_INSTALL_DIR}/conda-menu.sh"
 _CMH_STATE_DIR="${HOME}/.local/state/conda-menu"
@@ -227,13 +227,12 @@ _cmh_add_candidate_file() {
 }
 
 _cmh_add_candidate_root() {
-  # 用法：_cmh_add_candidate_root root_array sh_array exe_array root_path
-  local __roots="$1" __shs="$2" __exes="$3" root="$4" rr
+  # 用法：_cmh_add_candidate_root sh_array exe_array root_path
+  local __shs="$1" __exes="$2" root="$3" rr
   [[ -z "$root" ]] && return 0
   root="${root/#\~/$HOME}"
   rr="$(_cmh_realpath "$root" 2>/dev/null || printf '%s' "$root")"
   [[ -d "$rr" ]] || return 0
-  eval "$__roots+=(\"$rr\")"
   _cmh_add_candidate_file "$__shs" "$rr/etc/profile.d/conda.sh"
   _cmh_add_candidate_file "$__exes" "$rr/bin/conda"
   _cmh_add_candidate_file "$__exes" "$rr/condabin/conda"
@@ -353,7 +352,6 @@ _cmh_load_conda() {
   fi
 
   # 慢速兜底：只有快速路径失败时，才完整搜索软链接、常见目录和 shell 配置。
-  local roots=()
   local sh_candidates=()
   local exe_candidates=()
   local p root f
@@ -361,30 +359,30 @@ _cmh_load_conda() {
   # 0) 用户手动保存过的安装目录，优先级最高。
   if [[ -s "${_CMH_ROOT_FILE}" ]]; then
     while IFS= read -r root; do
-      _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
+      _cmh_add_candidate_root sh_candidates exe_candidates "$root"
     done < "${_CMH_ROOT_FILE}"
   fi
 
   # 1) Conda 自己的环境变量。
-  [[ -n "${CONDA_PREFIX:-}" ]] && _cmh_add_candidate_root roots sh_candidates exe_candidates "${CONDA_PREFIX}"
+  [[ -n "${CONDA_PREFIX:-}" ]] && _cmh_add_candidate_root sh_candidates exe_candidates "${CONDA_PREFIX}"
   [[ -n "${CONDA_EXE:-}" ]] && {
     _cmh_add_candidate_file exe_candidates "${CONDA_EXE}"
     root="$(_cmh_root_from_conda_exe "${CONDA_EXE}" 2>/dev/null || true)"
-    [[ -n "$root" ]] && _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
+    [[ -n "$root" ]] && _cmh_add_candidate_root sh_candidates exe_candidates "$root"
   }
-  [[ -n "${MAMBA_ROOT_PREFIX:-}" ]] && _cmh_add_candidate_root roots sh_candidates exe_candidates "${MAMBA_ROOT_PREFIX}"
+  [[ -n "${MAMBA_ROOT_PREFIX:-}" ]] && _cmh_add_candidate_root sh_candidates exe_candidates "${MAMBA_ROOT_PREFIX}"
 
   # 2) PATH 里已有 conda 可执行文件。
   p="$(type -P conda 2>/dev/null || true)"
   if [[ -n "$p" ]]; then
     _cmh_add_candidate_file exe_candidates "$p"
     root="$(_cmh_root_from_conda_exe "$p" 2>/dev/null || true)"
-    [[ -n "$root" ]] && _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
+    [[ -n "$root" ]] && _cmh_add_candidate_root sh_candidates exe_candidates "$root"
   fi
 
   # 3) 常见目录。这里会解析软链接，例如 ~/miniconda3 -> /data/app/miniconda3。
   for root in "${_CMH_COMMON_ROOTS[@]}"; do
-    _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
+    _cmh_add_candidate_root sh_candidates exe_candidates "$root"
   done
 
   # 4) 从用户 shell 配置里解析 conda init 写入过的路径。
@@ -393,12 +391,12 @@ _cmh_load_conda() {
     case "$f" in
       */etc/profile.d/conda.sh)
         _cmh_add_candidate_file sh_candidates "$f"
-        _cmh_add_candidate_root roots sh_candidates exe_candidates "${f%/etc/profile.d/conda.sh}"
+        _cmh_add_candidate_root sh_candidates exe_candidates "${f%/etc/profile.d/conda.sh}"
         ;;
       */bin/conda|*/condabin/conda)
         _cmh_add_candidate_file exe_candidates "$f"
         root="$(_cmh_root_from_conda_exe "$f" 2>/dev/null || true)"
-        [[ -n "$root" ]] && _cmh_add_candidate_root roots sh_candidates exe_candidates "$root"
+        [[ -n "$root" ]] && _cmh_add_candidate_root sh_candidates exe_candidates "$root"
         ;;
     esac
   done < <(_cmh_scan_profile_for_conda | _cmh_unique_lines)
@@ -803,13 +801,6 @@ _cmh_activate_env() {
   fi
 }
 
-_cmh_deactivate_env() {
-  _cmh_need_conda || return 1
-  conda deactivate
-  _cmh_ok "已执行 conda deactivate"
-  _cmh_log "deactivate"
-}
-
 _cmh_create_env() {
   _cmh_need_conda || return 1
   local name pyver install_basic
@@ -946,156 +937,6 @@ _cmh_create_clone_menu() {
   esac
 }
 
-_cmh_shell_single_quote() {
-  # 输出可安全放进单引号里的 shell 字符串。
-  # 例如：abc'def -> 'abc'\''def'
-  local x="$1"
-  printf "'"
-  printf "%s" "$x" | sed "s/'/'\\\\''/g"
-  printf "'"
-}
-
-_cmh_find_conda_exe() {
-  local root exe p
-
-  if [[ -n "${CONDA_EXE:-}" ]]; then
-    exe="$(_cmh_realpath "${CONDA_EXE}" 2>/dev/null || printf '%s' "${CONDA_EXE}")"
-    [[ -f "$exe" || -x "$exe" ]] && { printf '%s\n' "$exe"; return 0; }
-  fi
-
-  root="$(_cmh_guess_conda_root_quiet 2>/dev/null || true)"
-  if [[ -n "$root" ]]; then
-    for p in "$root/bin/conda" "$root/condabin/conda"; do
-      p="$(_cmh_realpath "$p" 2>/dev/null || printf '%s' "$p")"
-      [[ -f "$p" || -x "$p" ]] && { printf '%s\n' "$p"; return 0; }
-    done
-  fi
-
-  if _cmh_need_conda >/dev/null 2>&1; then
-    root="$(conda info --base 2>/dev/null || true)"
-    if [[ -n "$root" ]]; then
-      for p in "$root/bin/conda" "$root/condabin/conda"; do
-        p="$(_cmh_realpath "$p" 2>/dev/null || printf '%s' "$p")"
-        [[ -f "$p" || -x "$p" ]] && { printf '%s\n' "$p"; return 0; }
-      done
-    fi
-  fi
-
-  exe="$(type -P conda 2>/dev/null || true)"
-  if [[ -n "$exe" ]]; then
-    exe="$(_cmh_realpath "$exe" 2>/dev/null || printf '%s' "$exe")"
-    [[ -f "$exe" || -x "$exe" ]] && { printf '%s\n' "$exe"; return 0; }
-  fi
-
-  return 1
-}
-
-_cmh_bashrc_without_conda_init() {
-  # stdout 输出删除官方 conda initialize 块之后的 bashrc 内容。
-  # 只删除 Conda 官方块，不碰 conda-menu-helper 自己的 cx 注册块。
-  local bashrc="${1:-${_CMH_BASHRC}}"
-  if [[ ! -f "$bashrc" ]]; then
-    return 0
-  fi
-  awk -v begin="${_CMH_CONDA_INIT_BEGIN}" -v end="${_CMH_CONDA_INIT_END}" '
-    $0 == begin {skip=1; next}
-    $0 == end {skip=0; next}
-    skip != 1 {print}
-  ' "$bashrc"
-}
-
-_cmh_has_conda_init_block() {
-  [[ -f "${_CMH_BASHRC}" ]] && grep -Fq "${_CMH_CONDA_INIT_BEGIN}" "${_CMH_BASHRC}"
-}
-
-_cmh_conda_init_block() {
-  local exe="$1" root qexe qsh qbin
-  root="$(_cmh_root_from_conda_exe "$exe" 2>/dev/null || true)"
-  [[ -z "$root" ]] && root="$(_cmh_guess_conda_root_quiet 2>/dev/null || true)"
-
-  qexe="$(_cmh_shell_single_quote "$exe")"
-  qsh="$(_cmh_shell_single_quote "$root/etc/profile.d/conda.sh")"
-  qbin="$(_cmh_shell_single_quote "$root/bin")"
-
-  cat <<EOS
-${_CMH_CONDA_INIT_BEGIN}
-# !! Contents within this block are managed by 'conda init' / conda-menu-helper !!
-__conda_setup="\$(${qexe} 'shell.bash' 'hook' 2> /dev/null)"
-if [ \$? -eq 0 ]; then
-    eval "\$__conda_setup"
-else
-    if [ -f ${qsh} ]; then
-        . ${qsh}
-    else
-        export PATH=${qbin}:"\$PATH"
-    fi
-fi
-unset __conda_setup
-${_CMH_CONDA_INIT_END}
-EOS
-}
-
-_cmh_backup_bashrc() {
-  _cmh_mkdirs
-  if [[ -f "${_CMH_BASHRC}" ]]; then
-    local b="${_CMH_BACKUP_DIR}/bashrc.$(date '+%Y%m%d_%H%M%S').bak"
-    cp "${_CMH_BASHRC}" "$b"
-    _cmh_info "已备份 ~/.bashrc 到：$b"
-  fi
-}
-
-_cmh_conda_enable_init() {
-  local exe tmp
-  exe="$(_cmh_find_conda_exe 2>/dev/null || true)"
-  if [[ -z "$exe" ]]; then
-    _cmh_err "没有找到 conda 可执行文件，无法写入 conda 初始化块。"
-    _cmh_info "可先在 [7] -> [5] 手动指定 Conda 安装目录。"
-    return 1
-  fi
-
-  _cmh_backup_bashrc
-  tmp="$(mktemp)"
-  _cmh_bashrc_without_conda_init "${_CMH_BASHRC}" > "$tmp"
-  {
-    printf '\n'
-    _cmh_conda_init_block "$exe"
-  } >> "$tmp"
-  cp "$tmp" "${_CMH_BASHRC}"
-  rm -f "$tmp"
-
-  _cmh_ok "已启用 Conda 初始化。新终端会自动加载 conda 命令。"
-  _cmh_info "写入位置：${_CMH_BASHRC}"
-  _cmh_info "当前终端已经由 cx 临时加载 conda；新配置可执行 source ~/.bashrc 或重开终端生效。"
-  _cmh_log "conda init enable exe=${exe}"
-}
-
-_cmh_conda_disable_init() {
-  if ! _cmh_has_conda_init_block; then
-    _cmh_warn "~/.bashrc 中没有检测到官方 conda initialize 块，无需停用。"
-    _cmh_info "这不会影响 cx；cx 会在需要时临时加载 conda。"
-    return 0
-  fi
-
-  _cmh_backup_bashrc
-  local tmp
-  tmp="$(mktemp)"
-  _cmh_bashrc_without_conda_init "${_CMH_BASHRC}" > "$tmp"
-  cp "$tmp" "${_CMH_BASHRC}"
-  rm -f "$tmp"
-
-  _cmh_ok "已停用 Conda 自动初始化，并保留 cx 菜单注册。"
-  _cmh_info "新终端默认不会自动加载 conda；需要环境时输入 cx 再选择即可。"
-  _cmh_log "conda init disable"
-}
-
-_cmh_builtin_auto_activate_base() {
-  _cmh_need_conda || return 1
-  local val="$1"
-  conda config --set auto_activate_base "$val"
-  _cmh_ok "已设置 auto_activate_base=${val}。重新打开终端或 source ~/.bashrc 后生效。"
-  _cmh_log "auto_activate_base=${val}"
-}
-
 _cmh_conda_command_loaded() {
   # 判断当前 shell 里 conda 是否已经可直接使用。
   # 注意：type -t 可能返回 function / file / alias。
@@ -1226,59 +1067,6 @@ _cmh_conda_onoff_menu() {
     *) _cmh_err "选择无效：$c"; return 1 ;;
   esac
 }
-_cmh_show_envs() {
-  _cmh_need_conda || return 1
-  _cmh_hr
-  printf "%bConda 环境列表%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
-  conda env list
-}
-
-_cmh_recent_menu() {
-  _cmh_need_conda || return 1
-  _cmh_hr
-  printf "%b最近使用的环境%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
-  if [[ ! -s "${_CMH_RECENT_FILE}" ]]; then
-    _cmh_warn "暂无最近环境记录。"
-    return 0
-  fi
-
-  local i=1 line choice env
-  mapfile -t _cmh_recent_arr < "${_CMH_RECENT_FILE}"
-  for line in "${_cmh_recent_arr[@]}"; do :; done 2>/dev/null || true
-  # 上面的变量大小写无意义，保留兼容；下面正式输出。
-  mapfile -t _cmh_recent_arr < <(awk 'NF {print}' "${_CMH_RECENT_FILE}" | head -n 20)
-  for env in "${_cmh_recent_arr[@]}"; do
-    if _cmh_env_exists "$env"; then
-      printf "  %2d) %s\n" "$i" "$env"
-    else
-      printf "  %2d) %s %b已不存在%b\n" "$i" "$env" "${_CMH_YELLOW}[" "${_CMH_RESET}]"
-    fi
-    ((i++))
-  done
-
-  printf "\n"
-  read -r -p "输入序号进入环境；d 清空记录；q 返回：" choice
-  case "$choice" in
-    q|Q|"") return 0 ;;
-    d|D)
-      : > "${_CMH_RECENT_FILE}"
-      _cmh_ok "已清空最近记录。"
-      return 0
-      ;;
-  esac
-
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#_cmh_recent_arr[@]} )); then
-    env="${_cmh_recent_arr[$((choice-1))]}"
-    if _cmh_env_exists "$env"; then
-      _cmh_activate_env "$env"
-    else
-      _cmh_err "环境已不存在：$env"
-    fi
-  else
-    _cmh_err "选择无效。"
-  fi
-}
-
 # -------------------------------
 # 镜像源管理
 # -------------------------------
@@ -1352,6 +1140,9 @@ _cmh_condarc_apply() {
   keys="$(printf '%s\n' "$kept" | grep -E '^[^[:space:]-]' | grep -v '^#' | sed 's/[[:space:]]*:.*//' | paste -sd, - | sed 's/,/, /g')"
   if [[ -n "$keys" ]]; then
     _cmh_info "已保留原有配置项：${keys}"
+  fi
+  if [[ "$keys" == *channel_alias* ]]; then
+    _cmh_info "注意：channel_alias 已原样保留，未列入本镜像的具名渠道仍会经它解析。"
   fi
   _cmh_log "condarc rewrite keep=${keys:-none}"
 }
@@ -1503,9 +1294,9 @@ _cmh_mirror_help() {
   _cmh_hr
   printf "%b镜像源帮助%b\n" "${_CMH_BOLD}" "${_CMH_RESET}"
   cat <<EOF
-测速对象：各源在当前渠道下的 repodata.json 前 256KB（本机归档目录：$(_cmh_conda_subdir)）。
-用途：判断可访问性与大致响应速度；403（被拦截）、404（路径失效）、超时都会显示 FAIL。
-选择：测速完成后仍由你手动选择，不自动切换最快源。
+测速：按 [t] 触发，测各源在当前渠道下的 repodata.json 前 256KB（本机归档目录：$(_cmh_conda_subdir)）；
+      403（被拦截）、404（路径失效）、超时都会显示 FAIL。
+选择：不测速也可以直接选源；测速完成后仍由你手动选择，不自动切换最快源。
 恢复：选择 [9] 按当前发行版恢复官方渠道（miniforge/mambaforge → conda-forge，miniconda/anaconda → defaults）。
 EOF
 }
@@ -1555,41 +1346,54 @@ _cmh_mirror_menu() {
     fi
   done
 
-  for i in "${!names[@]}"; do
-    printf "  [%d] %-12s %s ... " "$((i+1))" "${names[$i]}" "${probes[$i]}"
-    result="$(_cmh_speed_one "$(_cmh_probe_url "${probes[$i]}")")"
-    if [[ "$result" == "FAIL" || "$result" == "NO_TOOL" ]]; then
-      printf "%b%s%b\n" "${_CMH_RED}" "$result" "${_CMH_RESET}"
-    else
-      printf "%b%s%b\n" "${_CMH_GREEN}" "$result" "${_CMH_RESET}"
-    fi
-  done
-
-  printf "\n"
-  printf "  [8] 查看 ~/.condarc\n"
-  printf "  [9] 恢复官方源\n"
-  printf "  [h] 帮助\n"
-  printf "  [0] 返回\n"
-  printf "\n"
+  # 测速改为按需触发：断网/被拦截时 7 个源串行探测最长约 84 秒，
+  # 不能让用户在选择前干等；直接选源也允许（不测速也能换源）。
+  local tested=0
   local choice
-  read -r -p "请选择 [0-9/h]：" choice
-  case "$choice" in
-    0|"") return 2 ;;
-    8) _cmh_show_condarc; return 0 ;;
-    9) _cmh_restore_official; return 0 ;;
-    h|H|\?) _cmh_mirror_help; return 0 ;;
-  esac
-
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
-    local idx=$((choice-1))
-    if (( idx == last )); then
-      _cmh_restore_official
-    else
-      _cmh_write_condarc_for_base "${urls[$idx]}" "${names[$idx]}"
-    fi
-  else
-    _cmh_err "选择无效。"
-  fi
+  while true; do
+    printf "\n"
+    for i in "${!names[@]}"; do
+      printf "  [%d] %-12s %s" "$((i+1))" "${names[$i]}" "${probes[$i]}"
+      if (( tested )); then
+        result="$(_cmh_speed_one "$(_cmh_probe_url "${probes[$i]}")")"
+        if [[ "$result" == "FAIL" || "$result" == "NO_TOOL" ]]; then
+          printf "  %b%s%b\n" "${_CMH_RED}" "$result" "${_CMH_RESET}"
+        else
+          printf "  %b%s%b\n" "${_CMH_GREEN}" "$result" "${_CMH_RESET}"
+        fi
+      else
+        printf "\n"
+      fi
+    done
+    printf "\n"
+    printf "  [t] 测速\n"
+    printf "  [8] 查看 ~/.condarc\n"
+    printf "  [9] 恢复官方源\n"
+    printf "  [h] 帮助\n"
+    printf "  [0] 返回\n"
+    printf "\n"
+    read -r -p "请选择 [0-9/t/h]：" choice
+    case "$choice" in
+      t|T) tested=1 ;;
+      0|"") return 2 ;;
+      8) _cmh_show_condarc; return 0 ;;
+      9) _cmh_restore_official; return 0 ;;
+      h|H|\?) _cmh_mirror_help; return 0 ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+          local idx=$((choice-1))
+          if (( idx == last )); then
+            _cmh_restore_official
+          else
+            _cmh_write_condarc_for_base "${urls[$idx]}" "${names[$idx]}"
+          fi
+          return 0
+        fi
+        _cmh_err "选择无效：$choice"
+        return 1
+        ;;
+    esac
+  done
 }
 
 _cmh_show_condarc() {
